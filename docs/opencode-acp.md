@@ -24,3 +24,8 @@ The exchange is the same one OpenMausBot's `opencode acp` driver makes.
 The provider registers as `opencode` in the brain registry, exposes its model
 list through the provider card, and is switchable from the brain picker. Model
 selection happens per turn through ACP config options, not through a CLI flag.
+
+## Verification
+
+The integration is covered by the brain, ACP seat, and worker unit tests. A
+live run against OpenCode 2.2.5 streams `ready` and reports token usage.

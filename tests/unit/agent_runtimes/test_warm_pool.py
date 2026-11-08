@@ -244,6 +244,27 @@ def test_a_process_that_died_is_replaced(monkeypatch, tmp_path):
     assert rig.pids[1] != rig.pids[2]
 
 
+def test_abandon_drops_the_process_when_its_loop_is_gone(monkeypatch, tmp_path):
+    """An in-process app restart builds a new event loop.
+
+    The old pool's tasks and pipes belong to the loop that no longer runs, so
+    it must kill its child synchronously and forget it: awaiting the old
+    process from the new loop is what hung the first turn after a restart
+    ("got Future attached to a different loop").
+    """
+    rig = _Rig(monkeypatch, tmp_path)
+
+    async def scenario() -> None:
+        await rig.turn("hello", None)
+        warm = rig.pool._procs["hermit"]
+        rig.pool.abandon()
+        assert not rig.pool.has("hermit")
+        await asyncio.wait_for(warm.proc.wait(), timeout=5)
+        assert warm.proc.returncode is not None
+
+    asyncio.run(scenario())
+
+
 def test_a_cancelled_start_leaves_no_half_started_process(tmp_path):
     """Stop during a warm process' handshake: nothing half-started stays for
     the next turn to pick up."""

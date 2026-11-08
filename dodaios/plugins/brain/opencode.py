@@ -20,6 +20,13 @@ Two shapes, one provider, chosen by ``structured_prompts``:
 
 Like the other subscription-CLI brains, startup is a full coding-agent process,
 so this is deliberately not the install's default spoken brain.
+
+Measured startup is the reason for the warm process: one ``initialize`` costs
+~0.6 s and a fresh ``session/new`` another ~1 s, on every message. The brain
+therefore keeps one ``opencode acp`` process in a :class:`WarmPool` and runs
+each turn in a session of its own (the conversation travels in the prompt), so
+a turn pays ``session/new`` + ``session/prompt`` only. A busy pool falls back to
+the original one-process-per-turn path, which is also what a failed start uses.
 """
 
 from __future__ import annotations
@@ -36,9 +43,11 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from dodaios.agent_runtimes.acp import AcpTurn
+from dodaios.agent_runtimes.warm import Lease, SessionWant, WarmPool, WarmSpec, signature
 from dodaios.core.process_utils import NO_WINDOW_CREATIONFLAGS
 from dodaios.core.protocols import BrainDelta, BrainRequest
 
@@ -79,6 +88,90 @@ _PROBE_TTL_S: float = 600.0
 _PROBE_TIMEOUT_S: float = 15.0
 _probe_lock = threading.Lock()
 _probe_cache: tuple[float, bool] | None = None
+
+#: Key of the brain's warm process in the module pool. One process serves every
+#: turn; each turn opens a fresh ACP session, so conversations never mix.
+_WARM_KEY = "brain"
+
+_workdir_lock = threading.Lock()
+_workdir_path: str | None = None
+_warm_pool_instance: WarmPool | None = None
+_warm_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _brain_workdir() -> str:
+    """A stable scratch folder for this process' ACP sessions.
+
+    Tools are denied on every turn, so the folder needs no per-turn isolation;
+    it only keeps the coding agent out of the user's repository. One folder per
+    app process also lets the warm process keep the same ``cwd`` (and therefore
+    the same launch signature) across turns.
+    """
+    global _workdir_path
+    with _workdir_lock:
+        path = _workdir_path
+        if path is None or not os.path.isdir(path):
+            path = tempfile.mkdtemp(prefix="jarvis-opencode-brain-")
+            _workdir_path = path
+        return path
+
+
+def _warm_pool() -> WarmPool:
+    """The module's warm pool (one ``opencode acp`` process, reused).
+
+    The pool is bound to the event loop that built it. An in-process app
+    restart (``/api/settings/restart-app``) runs the server again on a NEW
+    loop, so the old pool's process and tasks belong to a loop that no longer
+    runs; leasing it would wait on a future nobody resolves (live 2026-11-08:
+    the first turn after a restart hung, then the process was killed with
+    "got Future attached to a different loop"). Drop it and start fresh.
+    """
+    global _warm_pool_instance, _warm_loop
+    loop = asyncio.get_running_loop()
+    if _warm_pool_instance is not None and _warm_loop is not loop:
+        log.info("opencode: the app's event loop changed; dropping the old warm process")
+        _warm_pool_instance.abandon()
+        _warm_pool_instance = None
+    if _warm_pool_instance is None:
+        _warm_pool_instance = WarmPool("opencode-brain")
+        _warm_loop = loop
+    return _warm_pool_instance
+
+
+def _warm_spec(binary: str, workdir: str) -> WarmSpec:
+    """The launch the warm process is started (and only reused) for."""
+    env = _child_env()
+    return WarmSpec(
+        argv=[binary, "acp"],
+        env=env,
+        cwd=Path(workdir),
+        signature=signature(binary, "acp", workdir, env),
+    )
+
+
+def _session_want(workdir: str) -> SessionWant:
+    """The session each turn needs: a fresh one with the brain's parameters.
+
+    ``resume=None`` and no ``bound`` flag mean the pool never hands a turn a
+    session an earlier turn used: the whole conversation is in the prompt.
+    """
+    return SessionWant(resume=None, params={"cwd": workdir, "mcpServers": []})
+
+
+async def _lease_warm(binary: str) -> Lease | None:
+    """Borrow the warm ACP process, or ``None`` to run the turn the cold way.
+
+    ``WarmPool.lease`` answers ``None`` when the process is busy with another
+    turn (it never blocks) or could not be prepared; the caller then starts its
+    own process, exactly as before.
+    """
+    workdir = _brain_workdir()
+    try:
+        pool = _warm_pool()
+        return await pool.lease(_WARM_KEY, _warm_spec(binary, workdir), _session_want(workdir))
+    except Exception as exc:  # noqa: BLE001 - a broken pool degrades to a cold turn
+        log.info("opencode: warm process unavailable (%s); starting a cold turn", exc)
+        return None
 
 
 def _resolve_binary() -> str | None:
@@ -185,9 +278,12 @@ class _QueueIO:
     The brain consumes deltas while the pump reads stdout; a direct async
     generator would deadlock the two. Permission requests are always denied by
     the turn (``auto_deny=True``), so ``ask`` is only a protocol placeholder.
+
+    ``proc`` is a child process or a warm :class:`Lease`: both carry a writable
+    ``stdin`` and the pump reads from the matching stdout.
     """
 
-    def __init__(self, proc: asyncio.subprocess.Process) -> None:
+    def __init__(self, proc: Any) -> None:
         self._proc = proc
         self.events: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
@@ -196,11 +292,67 @@ class _QueueIO:
         self._proc.stdin.write((json.dumps(frame) + "\n").encode("utf-8"))
         await self._proc.stdin.drain()
 
+    async def write_frame_line(self, line: str) -> None:
+        """Write one frame already rendered as a newline-terminated JSON line."""
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(line.encode("utf-8"))
+        await self._proc.stdin.drain()
+
     async def emit(self, event: dict[str, Any]) -> None:
         await self.events.put(event)
 
     async def ask(self, _call_id: str, _name: str, _args: dict[str, Any], _summary: str) -> str:
         return "deny"
+
+
+async def _pump_frames(
+    readline: Any,
+    turn: AcpTurn,
+    io: _QueueIO,
+    pump_error: list[BaseException],
+) -> None:
+    """Route the turn's stdout lines into ``io`` until its result arrives."""
+    try:
+        while True:
+            try:
+                raw = await readline()
+            except ValueError as exc:
+                # One line past the stream limit: a broken frame of the turn
+                # itself, not a reason to keep reading.
+                pump_error.append(exc)
+                return
+            if not raw:
+                return
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:  # a malformed line is not an ACP frame; skip it
+                continue
+            if not isinstance(obj, dict):
+                continue
+            await turn.on_message(obj, io)
+            if turn.saw_result:
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - reported with the turn's own error
+        pump_error.append(exc)
+    finally:
+        await io.events.put(None)
+
+
+async def _collect_stderr(readline: Any, chunks: list[str]) -> None:
+    """Keep the agent's diagnostics for the error the turn may raise."""
+    while True:
+        try:
+            line = await readline()
+        except ValueError:  # one oversized diagnostic line: dropped
+            continue
+        if not line:
+            return
+        chunks.append(line.decode("utf-8", errors="replace"))
 
 
 async def _stop(
@@ -324,9 +476,9 @@ class OpenCodeBrain:
             )
 
         prompt = self._render_prompt(req)
-        # A throwaway working directory: this brain answers questions and has no
+        # A scratch working directory: this brain answers questions and has no
         # business seeing, or being trusted in, the user's repository.
-        workdir = tempfile.mkdtemp(prefix="jarvis-opencode-brain-")
+        workdir = _brain_workdir()
         turn = AcpTurn(
             turn_id="opencode-brain",
             cwd=workdir,
@@ -334,7 +486,24 @@ class OpenCodeBrain:
             auto_deny=True,
             config=_config_for(self._model, req),
         )
-        creationflags = NO_WINDOW_CREATIONFLAGS if sys.platform == "win32" else 0
+        t0 = time.monotonic()
+
+        lease = await _lease_warm(binary)
+        if lease is not None:
+            # The pool's process finished its handshake already: start at this
+            # turn's own session instead of paying ``initialize`` again.
+            turn.initialized = lease.initialized
+            turn.open_session = lease.open_session
+            lease.turn = turn
+            log.info(
+                "opencode: turn on the warm acp process (model=%s, structured=%s, prompt=%d chars)",
+                self._model or "<agent default>",
+                self._structured_prompts,
+                len(prompt),
+            )
+            async for delta in self._warm_turn(turn, lease, t0):
+                yield delta
+            return
 
         log.info(
             "opencode: spawning acp turn (model=%s, structured=%s, prompt=%d chars)",
@@ -342,8 +511,13 @@ class OpenCodeBrain:
             self._structured_prompts,
             len(prompt),
         )
+        async for delta in self._cold_turn(turn, binary, t0):
+            yield delta
 
-        t0 = time.monotonic()
+    async def _cold_turn(self, turn: AcpTurn, binary: str, t0: float) -> AsyncIterator[BrainDelta]:
+        """One turn on a process this turn owns and stops afterwards."""
+        workdir = turn.cwd
+        creationflags = NO_WINDOW_CREATIONFLAGS if sys.platform == "win32" else 0
         try:
             proc = await asyncio.create_subprocess_exec(
                 binary,
@@ -357,7 +531,6 @@ class OpenCodeBrain:
                 limit=4 * 1024 * 1024,
             )
         except (FileNotFoundError, OSError) as exc:
-            shutil.rmtree(workdir, ignore_errors=True)
             log.warning("opencode: spawn failed: %s", exc)
             raise RuntimeError(f"OpenCode could not be launched: {exc}") from exc
 
@@ -368,120 +541,16 @@ class OpenCodeBrain:
         io = _QueueIO(proc)
         stderr_chunks: list[str] = []
         pump_error: list[BaseException] = []
-
-        async def _pump() -> None:
-            try:
-                while True:
-                    try:
-                        raw = await proc.stdout.readline()
-                    except ValueError as exc:
-                        # One line past the stream limit: a broken frame of the
-                        # turn itself, not a reason to keep reading.
-                        pump_error.append(exc)
-                        return
-                    if not raw:
-                        return
-                    line = raw.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except ValueError:  # a malformed line is not an ACP frame; skip it
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-                    await turn.on_message(obj, io)
-                    if turn.saw_result:
-                        return
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - reported with the turn's own error
-                pump_error.append(exc)
-            finally:
-                await io.events.put(None)
-
-        async def _drain_stderr() -> None:
-            while True:
-                line = await proc.stderr.readline()
-                if not line:
-                    return
-                stderr_chunks.append(line.decode("utf-8", errors="replace"))
-
-        pump_task = asyncio.create_task(_pump())
-        stderr_task = asyncio.create_task(_drain_stderr())
-        answer_parts: list[str] = []
-        usage: dict[str, int] = {}
+        pump_task = asyncio.create_task(_pump_frames(proc.stdout.readline, turn, io, pump_error))
+        stderr_task = asyncio.create_task(_collect_stderr(proc.stderr.readline, stderr_chunks))
 
         try:
             try:
-                proc.stdin.write(turn.opening_frame().encode("utf-8"))
-                await proc.stdin.drain()
+                await io.write_frame_line(turn.opening_frame())
             except (BrokenPipeError, ConnectionResetError) as exc:
                 raise RuntimeError("OpenCode closed its input during the handshake.") from exc
-
-            deadline = t0 + self._cli_timeout_s
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError
-                try:
-                    event = await asyncio.wait_for(
-                        io.events.get(), timeout=min(_TICK_S, remaining)
-                    )
-                except TimeoutError:  # no frame yet; the heartbeat delta keeps the turn alive
-                    if pump_task.done():
-                        break
-                    yield BrainDelta(content="")
-                    continue
-                if event is None:
-                    break
-                kind = event.get("kind")
-                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-                if kind == "text_delta":
-                    text = str(payload.get("text") or "")
-                    if text:
-                        answer_parts.append(text)
-                        yield BrainDelta(content=text)
-                elif kind == "usage_delta":
-                    raw_usage = payload.get("usage")
-                    if isinstance(raw_usage, dict):
-                        usage.update(
-                            {
-                                str(key): int(value)
-                                for key, value in raw_usage.items()
-                                if isinstance(value, int | float)
-                            }
-                        )
-
-            if pump_error:
-                raise RuntimeError(f"OpenCode ACP stream failed: {pump_error[0]}") from pump_error[0]
-            if turn.status != "done":
-                detail = "".join(stderr_chunks).strip()[:300]
-                reason = turn.error or f"OpenCode ended the turn ({turn.stop_reason or 'no answer'})"
-                raise RuntimeError(reason + (f": {detail}" if detail else ""))
-
-            answer = "".join(answer_parts)
-            if not answer.strip():
-                answer = turn.result_text
-            if not answer.strip():
-                detail = "".join(stderr_chunks).strip()[:300]
-                raise RuntimeError(
-                    "OpenCode returned no answer" + (f": {detail}" if detail else ".")
-                )
-            if not answer_parts:
-                yield BrainDelta(content=answer)
-
-            mapped = _usage_payload(usage or turn.usage)
-            if mapped:
-                yield BrainDelta(usage=mapped)
-
-            log.info(
-                "opencode turn ok: %d chars in %.1fs (model=%s)",
-                len(answer),
-                time.monotonic() - t0,
-                turn.agent_name or "OpenCode",
-            )
-            yield BrainDelta(finish_reason="stop")
+            async for delta in self._events(turn, io, pump_task, pump_error, stderr_chunks, t0):
+                yield delta
         except asyncio.CancelledError:
             with suppress(Exception):
                 await turn.cancel(io)
@@ -493,7 +562,120 @@ class OpenCodeBrain:
             ) from exc
         finally:
             await _stop(proc, pump_task, stderr_task, creationflags)
-            shutil.rmtree(workdir, ignore_errors=True)
+
+    async def _warm_turn(self, turn: AcpTurn, lease: Lease, t0: float) -> AsyncIterator[BrainDelta]:
+        """One turn on the shared warm process; the process stays afterwards."""
+        io = _QueueIO(lease)
+        stderr_chunks: list[str] = []
+        pump_error: list[BaseException] = []
+        pump_task = asyncio.create_task(_pump_frames(lease.stdout.readline, turn, io, pump_error))
+        stderr_task = asyncio.create_task(_collect_stderr(lease.stderr.readline, stderr_chunks))
+
+        try:
+            try:
+                await io.write_frame_line(turn.opening_frame())
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                raise RuntimeError("OpenCode closed its input during the handshake.") from exc
+            async for delta in self._events(turn, io, pump_task, pump_error, stderr_chunks, t0):
+                yield delta
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await turn.cancel(io)
+            log.info("opencode: cancelled (ending the warm acp process)")
+            raise
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"OpenCode did not answer within {self._cli_timeout_s:.0f}s."
+            ) from exc
+        finally:
+            # A prompt the agent answered proves the process (and its provider
+            # state) is healthy: hand it back for the next turn. A stop, a
+            # timeout or a broken stream is never guessed reusable.
+            if turn.saw_result:
+                with suppress(Exception):
+                    lease.finish()
+            else:
+                with suppress(Exception):
+                    lease.kill()
+            for task in (pump_task, stderr_task):
+                if not task.done():
+                    task.cancel()
+            for task in (pump_task, stderr_task):
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(task, timeout=3.0)
+
+    async def _events(
+        self,
+        turn: AcpTurn,
+        io: _QueueIO,
+        pump_task: asyncio.Task[None],
+        pump_error: list[BaseException],
+        stderr_chunks: list[str],
+        t0: float,
+    ) -> AsyncIterator[BrainDelta]:
+        """Stream one turn's deltas from the pump's queue."""
+        answer_parts: list[str] = []
+        usage: dict[str, int] = {}
+        deadline = t0 + self._cli_timeout_s
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            try:
+                event = await asyncio.wait_for(io.events.get(), timeout=min(_TICK_S, remaining))
+            except TimeoutError:  # no frame yet; the heartbeat delta keeps the turn alive
+                if pump_task.done():
+                    break
+                yield BrainDelta(content="")
+                continue
+            if event is None:
+                break
+            kind = event.get("kind")
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if kind == "text_delta":
+                text = str(payload.get("text") or "")
+                if text:
+                    answer_parts.append(text)
+                    yield BrainDelta(content=text)
+            elif kind == "usage_delta":
+                raw_usage = payload.get("usage")
+                if isinstance(raw_usage, dict):
+                    usage.update(
+                        {
+                            str(key): int(value)
+                            for key, value in raw_usage.items()
+                            if isinstance(value, int | float)
+                        }
+                    )
+
+        if pump_error:
+            raise RuntimeError(f"OpenCode ACP stream failed: {pump_error[0]}") from pump_error[0]
+        if turn.status != "done":
+            detail = "".join(stderr_chunks).strip()[:300]
+            reason = turn.error or f"OpenCode ended the turn ({turn.stop_reason or 'no answer'})"
+            raise RuntimeError(reason + (f": {detail}" if detail else ""))
+
+        answer = "".join(answer_parts)
+        if not answer.strip():
+            answer = turn.result_text
+        if not answer.strip():
+            detail = "".join(stderr_chunks).strip()[:300]
+            raise RuntimeError("OpenCode returned no answer" + (f": {detail}" if detail else "."))
+        if not answer_parts:
+            yield BrainDelta(content=answer)
+
+        mapped = _usage_payload(usage or turn.usage)
+        if mapped:
+            yield BrainDelta(usage=mapped)
+
+        log.info(
+            "opencode turn ok: %d chars in %.1fs (model=%s)",
+            len(answer),
+            time.monotonic() - t0,
+            turn.agent_name or "OpenCode",
+        )
+        yield BrainDelta(finish_reason="stop")
 
     def estimate_cost(self, req: BrainRequest) -> float:
         """Zero: OpenCode spends the user's own plan or its free models.

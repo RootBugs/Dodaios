@@ -9,13 +9,36 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from dodaios.agent_runtimes.warm import WarmPool, WarmSpec
 from dodaios.core.protocols import BrainMessage, BrainRequest
 from dodaios.plugins.brain import opencode as ocmod
 from dodaios.plugins.brain.opencode import OpenCodeBrain, _config_for
+
+_FAKE_AGENT = Path(__file__).resolve().parents[3] / "fakes" / "fake_acp_agent.py"
+
+
+class _NoWarmPool:
+    """A pool that never has a process: the cold spawn path is exercised."""
+
+    async def lease(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _cold_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fake-subprocess tests below exercise the cold turn explicitly.
+
+    Warm reuse has its own tests at the end of this file; here the pool always
+    reports "no process" so the original spawn path (and its fake) runs.
+    """
+    monkeypatch.setattr(ocmod, "_warm_pool", lambda: _NoWarmPool())
 
 
 def _req(text: str = "Hello") -> BrainRequest:
@@ -47,9 +70,7 @@ def _initialize_result() -> dict[str, Any]:
     }
 
 
-def _session_result(
-    *, config_options: list[dict[str, Any]] | None = None
-) -> dict[str, Any]:
+def _session_result(*, config_options: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
         "id": 2,
@@ -148,9 +169,7 @@ class _Spawned:
         self.kwargs: dict[str, Any] = {}
 
 
-def _install(
-    monkeypatch: pytest.MonkeyPatch, lines: list[dict[str, Any]]
-) -> _Spawned:
+def _install(monkeypatch: pytest.MonkeyPatch, lines: list[dict[str, Any]]) -> _Spawned:
     spawned = _Spawned(_FakeProc(lines))
 
     async def fake_exec(*args: Any, **kwargs: Any) -> _FakeProc:
@@ -182,9 +201,7 @@ async def test_complete_streams_the_acp_answer_and_applies_the_model(
             },
             _chunk("Hello "),
             _chunk("there"),
-            _prompt_result(
-                usage={"inputTokens": 12, "outputTokens": 5, "cachedReadTokens": 2}
-            ),
+            _prompt_result(usage={"inputTokens": 12, "outputTokens": 5, "cachedReadTokens": 2}),
         ],
     )
 
@@ -354,3 +371,188 @@ async def test_complete_raises_when_the_binary_is_missing(
     with pytest.raises(RuntimeError, match="not installed"):
         async for _ in brain.complete(_req()):
             pass
+
+
+# --------------------------------------------------------------- warm process
+
+
+class _LeaseStdout:
+    """Scripted lines, then silence: the turn keeps waiting for its result."""
+
+    def __init__(self, lines: list[dict[str, Any]]) -> None:
+        self._lines = [_frame(line) for line in lines]
+        self._silence = asyncio.Event()
+
+    async def readline(self) -> bytes:
+        if self._lines:
+            await asyncio.sleep(0)
+            return self._lines.pop(0)
+        await self._silence.wait()
+        return b""
+
+
+class _FakeLease:
+    """The pool's process as the brain sees it (``warm.Lease`` shape)."""
+
+    def __init__(self, lines: list[dict[str, Any]], *, initialized: dict[str, Any]) -> None:
+        self.stdin = _FakeStdin()
+        self.stdout = _LeaseStdout(lines)
+        self.stderr = _FakeStderr()
+        self.initialized = initialized
+        self.open_session = ""
+        self.turn: Any = None
+        self.finished = False
+        self.killed = False
+
+    def finish(self) -> None:
+        self.finished = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+@pytest.mark.asyncio
+async def test_a_warm_lease_skips_the_handshake_and_is_returned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _FakeLease(
+        [
+            _session_result(config_options=[]),
+            _chunk("warm "),
+            _chunk("answer"),
+            _prompt_result(),
+        ],
+        initialized=_initialize_result()["result"],
+    )
+
+    async def fake_lease(_binary: str) -> _FakeLease:
+        return lease
+
+    monkeypatch.setattr(ocmod, "_lease_warm", fake_lease)
+    deltas = [delta async for delta in OpenCodeBrain().complete(_req())]
+
+    assert "".join(delta.content or "" for delta in deltas) == "warm answer"
+    # No ``initialize``: the pool's process answered it once for every turn.
+    assert lease.stdin.methods()[:2] == ["session/new", "session/prompt"]
+    # The turn recorded itself, so the pool can remember its session.
+    assert lease.turn is not None
+    # A healthy process is handed back, never killed.
+    assert lease.finished is True
+    assert lease.killed is False
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_warm_turn_cancels_the_prompt_and_ends_the_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lease = _FakeLease(
+        [_session_result(config_options=[])],  # the prompt is never answered
+        initialized=_initialize_result()["result"],
+    )
+
+    async def fake_lease(_binary: str) -> _FakeLease:
+        return lease
+
+    monkeypatch.setattr(ocmod, "_lease_warm", fake_lease)
+    brain = OpenCodeBrain()
+
+    async def consume() -> None:
+        async for _ in brain.complete(_req()):
+            pass
+
+    task = asyncio.create_task(consume())
+    for _ in range(200):
+        if "session/prompt" in lease.stdin.methods():
+            break
+        await asyncio.sleep(0.01)
+    assert "session/prompt" in lease.stdin.methods()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert lease.stdin.methods()[-1] == "session/cancel"
+    assert lease.killed is True
+    assert lease.finished is False
+
+
+@pytest.mark.asyncio
+async def test_turns_share_one_process_and_open_a_fresh_session_each(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pool runs one process; every turn still starts at ``session/new``.
+
+    The conversation lives in the prompt, so reusing the previous ACP session
+    would mix two unrelated turns: the brain's ``SessionWant`` must ask for a
+    fresh one each time (``resume=None``, never bound).
+    """
+    pool = WarmPool("opencode-brain")
+    log = tmp_path / "frames.log"
+    env = dict(os.environ)
+    env["FAKE_ACP_LOG"] = str(log)
+    spec = WarmSpec(
+        argv=[sys.executable, str(_FAKE_AGENT)],
+        env=env,
+        cwd=tmp_path,
+        signature="fake-agent",
+    )
+    monkeypatch.setattr(ocmod, "_resolve_binary", lambda: "opencode")
+    monkeypatch.setattr(ocmod, "_warm_pool", lambda: pool)
+    monkeypatch.setattr(ocmod, "_warm_spec", lambda *_args: spec)
+
+    brain = OpenCodeBrain(model="opencode/glm-5.3-flash-free")
+    try:
+        first = [delta async for delta in brain.complete(_req("one"))]
+        second = [delta async for delta in brain.complete(_req("two"))]
+    finally:
+        await pool.stop()
+
+    assert "".join(delta.content or "" for delta in first) == (
+        "echo: " + brain._render_prompt(_req("one"))[-80:]
+    )
+    assert "".join(delta.content or "" for delta in second) == (
+        "echo: " + brain._render_prompt(_req("two"))[-80:]
+    )
+    methods = [
+        str(json.loads(line).get("method"))
+        for line in log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert methods == [
+        "initialize",
+        "session/new",
+        "session/prompt",
+        "session/new",
+        "session/prompt",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_rebuilt_event_loop_drops_the_stale_warm_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-process app restart builds a new loop; the old pool must go.
+
+    Its process and tasks belong to the loop that no longer runs, so leasing
+    it would wait forever on a future nobody resolves. The brain drops it
+    (killing the child) and builds a fresh pool on the running loop.
+    """
+
+    class _StalePool:
+        abandoned = False
+
+        def abandon(self) -> None:
+            self.abandoned = True
+
+    stale = _StalePool()
+    old_loop = asyncio.new_event_loop()
+    try:
+        monkeypatch.undo()  # the autouse fixture hides the real pool factory
+        monkeypatch.setattr(ocmod, "_warm_pool_instance", stale)
+        monkeypatch.setattr(ocmod, "_warm_loop", old_loop)
+        pool = ocmod._warm_pool()
+    finally:
+        old_loop.close()
+
+    assert stale.abandoned is True
+    assert pool is not stale
+    assert ocmod._warm_loop is asyncio.get_running_loop()
